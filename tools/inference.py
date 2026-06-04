@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import uuid
+import inspect
 from threading import Thread
 from typing import Optional
 
@@ -105,6 +106,12 @@ class S2SInference:
         # print("model", model)
         print(f"{model.config.model_type=}")
         print(f"{model.hf_device_map=}")
+        print(
+            "[OD-COMPARE][official] model_source: "
+            f"model_class={type(model).__module__}.{type(model).__name__} "
+            f"model_source={inspect.getsourcefile(type(model))}",
+            flush=True,
+        )
 
         model.generation_config = GenerationConfig.from_pretrained(
             model_name_or_path, trust_remote_code=True
