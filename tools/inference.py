@@ -269,6 +269,20 @@ class S2SInference:
         input_ids = torch.tensor([input_ids], dtype=torch.long).to("cuda")
         
         print("input", self.tokenizer.decode(input_ids[0], skip_special_tokens=False), flush=True)
+        prompt_token_ids_cpu = input_ids[0].detach().cpu()
+        prompt_preview = self.tokenizer.decode(
+            prompt_token_ids_cpu.tolist(),
+            skip_special_tokens=False,
+        )[:500].replace("\n", "\\n")
+        print(
+            "[OD-COMPARE][official] generate_start: "
+            f"prompt_tokens={input_ids.shape[1]} task={task!r} steps={steps} max_new_tokens={max_tokens} "
+            f"alg={alg} cfg={cfg} temperature=0.0 top_p=0.9 add_boa_token={add_boa_token!r} "
+            f"max_position_penalty={max_position_penalty} repeat_penalty={repeat_penalty} "
+            f"output_text_only={output_text_only} prompt_head={prompt_token_ids_cpu[:12].tolist()} "
+            f"prompt_tail={prompt_token_ids_cpu[-12:].tolist()} prompt_preview={prompt_preview!r}",
+            flush=True,
+        )
         outputs, histories = self.model.generate(
             input_ids,
             audios=audios,
@@ -287,7 +301,21 @@ class S2SInference:
             task=task,
         )
 
-        output = self.tokenizer.decode(outputs[0][input_ids.shape[1]: ], skip_special_tokens=False)
+        generated_token_ids = outputs[0][input_ids.shape[1]:]
+        generated_token_ids_cpu = generated_token_ids.detach().cpu()
+        output = self.tokenizer.decode(generated_token_ids, skip_special_tokens=False)
+        image_code_matches = re.findall(r"<\|image_(\d+)\|>", output)
+        image_start_id = self.tokenizer.convert_tokens_to_ids("<|begin_of_image|>")
+        image_end_id = self.tokenizer.convert_tokens_to_ids("<|end_of_image|>")
+        image_start_count = int((generated_token_ids == image_start_id).sum().item())
+        image_end_count = int((generated_token_ids == image_end_id).sum().item())
+        print(
+            "[OD-COMPARE][official] generate_raw_output: "
+            f"generated={generated_token_ids.numel()} begin_count={image_start_count} end_count={image_end_count} "
+            f"regex_image_tokens={len(image_code_matches)} output_head={generated_token_ids_cpu[:12].tolist()} "
+            f"output_tail={generated_token_ids_cpu[-12:].tolist()} output_preview={output[:500].replace(chr(10), chr(92) + 'n')!r}",
+            flush=True,
+        )
         print(f"{output=}", flush=True)
         
         audio_offset = self.tokenizer.convert_tokens_to_ids("<|audio_0|>")
@@ -303,6 +331,23 @@ class S2SInference:
             else:
                 text_tokens.append(token_id)
 
+        if len(image_tokens) > 0:
+            image_token_tensor = torch.stack(image_tokens, dim=0).detach().cpu()
+            print(
+                "[OD-COMPARE][official] split_tokens: "
+                f"text={len(text_tokens)} audio={len(audio_tokens)} image={len(image_tokens)} "
+                f"image_min={int(image_token_tensor.min().item())} image_max={int(image_token_tensor.max().item())} "
+                f"image_unique={int(torch.unique(image_token_tensor).numel())} "
+                f"image_head={image_token_tensor[:8].tolist()} image_tail={image_token_tensor[-8:].tolist()}",
+                flush=True,
+            )
+        else:
+            print(
+                "[OD-COMPARE][official] split_tokens: "
+                f"text={len(text_tokens)} audio={len(audio_tokens)} image=0",
+                flush=True,
+            )
+
         if len(audio_tokens) > 0:
             tts_speech = self.audio_tokenizer.decode(
                 audio_tokens, source_speech_16k=None
@@ -317,8 +362,22 @@ class S2SInference:
         if len(image_tokens) > 0:
             gen_token_ids = torch.stack(image_tokens, dim=0).unsqueeze(0)
             gen_token_ids = torch.clamp(gen_token_ids, max=8192 - 1, min=0)
+            gen_token_ids_cpu = gen_token_ids[0].detach().cpu()
+            print(
+                "[OD-COMPARE][official] decode_input: "
+                f"count={gen_token_ids.shape[1]} used={min(gen_token_ids.shape[1], 256)} "
+                f"head={gen_token_ids_cpu[:8].tolist()} tail={gen_token_ids_cpu[-8:].tolist()}",
+                flush=True,
+            )
             image = self.image_processor.image_tokenizer.image_tokenizer.decode_code(gen_token_ids[:, :256]) 
             image = torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
+            print(
+                "[OD-COMPARE][official] decoded_image: "
+                f"shape={tuple(image.shape)} dtype={image.dtype} min={float(image.min().item()):.4f} "
+                f"max={float(image.max().item()):.4f} mean={float(image.mean().item()):.4f} "
+                f"std={float(image.std().item()):.4f}",
+                flush=True,
+            )
             image *= 255.0
             image = image.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
             image = image[:, :, :, [2, 1, 0]][0]
