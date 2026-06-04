@@ -755,7 +755,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                     # if device_map is None, load the state dict and move the params from meta device to the cpu
                     if device_map is None and not is_sharded:
                         param_device = "cpu"
-                        state_dict = diffusers.models.model_loading_utils.load_state_dict(model_file, variant=variant)
+                        state_dict = diffusers.models.model_loading_utils.load_state_dict(model_file)
                         model._convert_deprecated_attn(state_dict)
                         # move the params from meta device to cpu
                         missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
@@ -770,15 +770,17 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                         unexpected_keys = load_model_dict_into_meta(
                             model,
                             state_dict,
-                            device=param_device,
                             dtype=torch_dtype,
                             model_name_or_path=pretrained_model_name_or_path,
                         )
 
                         if cls._keys_to_ignore_on_load_unexpected is not None:
                             for pat in cls._keys_to_ignore_on_load_unexpected:
-                                unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
+                                unexpected_keys = [
+                                    k for k in unexpected_keys if k is not None and re.search(pat, k) is None
+                                ]
 
+                        unexpected_keys = [k for k in unexpected_keys if k is not None]
                         if len(unexpected_keys) > 0:
                             logger.warning(
                                 f"Some weights of the model checkpoint were not used when initializing "
@@ -855,7 +857,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             else:
                 model = cls.from_config(config, **unused_kwargs)
 
-                state_dict = load_state_dict(model_file, variant=variant)
+                state_dict = load_state_dict(model_file)
                 model._convert_deprecated_attn(state_dict)
 
                 model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(

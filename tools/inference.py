@@ -100,7 +100,7 @@ class S2SInference:
             trust_remote_code=True,
             device_map=device_map,
             torch_dtype=torch_dtype,
-            attn_implementation="flash_attention_2",
+            attn_implementation="eager",
         ).eval()
         # print("model", model)
         print(f"{model.config.model_type=}")
@@ -594,26 +594,6 @@ if __name__ == "__main__":
     images = None
     speech = None
 
-    # speech-to-image
-    output, images = s2i_task(s2s_inference, 260, 260, "entropy-penalty", 1.5)
-    save_output(output_path, "s2i", output, images, None)
-
     # text-to-image
     output, images = t2i_task(s2s_inference, 260, 260, "entropy-penalty", 1.2)
     save_output(output_path, "t2i", output, images, None)
-
-    # spoken visual qa
-    output, speech = svqa_task(s2s_inference, 128, 128, "entropy-penalty", 1.2)
-    save_output(output_path, "svqa", output, None, speech)
-
-    # visual qa
-    output = vqa_task(s2s_inference, 64, 64, "entropy", 1.0)
-    save_output(output_path, "vqa", output, None, None)
-
-    # tts
-    output, speech = tts_task(s2s_inference, 50, 25, "entropy", 1.0)
-    save_output(output_path, "tts", output, None, speech)
-
-    # asr
-    output = asr_task(s2s_inference, 50, 25, "entropy", 1.0)
-    save_output(output_path, "asr", output, None, None)
