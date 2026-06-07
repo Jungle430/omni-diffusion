@@ -236,6 +236,79 @@ def install_generation_debug_hooks(model: Any) -> None:
     model._sample = sample_wrapper
 
 
+def tensor_stats(tensor: torch.Tensor) -> str:
+    tensor = tensor.detach()
+    finite = tensor[torch.isfinite(tensor)]
+    if finite.numel() == 0:
+        return f"shape={list(tensor.shape)} dtype={tensor.dtype} device={tensor.device} finite=0"
+    stats_tensor = finite.float()
+    return (
+        f"shape={list(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+        f"finite={finite.numel()} min={stats_tensor.min().item():.4f} "
+        f"max={stats_tensor.max().item():.4f} mean={stats_tensor.mean().item():.4f} "
+        f"std={stats_tensor.std(unbiased=False).item():.4f}"
+    )
+
+
+def make_generation_step_hooks(tokenizer: Any, mask_token_id: int):
+    image_offset = tokenizer.convert_tokens_to_ids("<|image_0|>")
+    log_steps = {0, 1}
+
+    def summarize_x(step: int | None, x: torch.Tensor, label: str) -> None:
+        x_cpu = x[0].detach().cpu()
+        image_ids = [
+            int(token_id - image_offset)
+            for token_id in x_cpu.tolist()
+            if image_offset <= token_id < image_offset + 8192
+        ]
+        print(
+            f"[OD-COMPARE][official-direct] {label}: "
+            f"step={step} shape={list(x.shape)} mask_count={int((x == mask_token_id).sum().item())} "
+            f"nonzero_count={int((x != 0).sum().item())} "
+            f"seq_head={x_cpu[:12].tolist()} seq_tail={x_cpu[-12:].tolist()} "
+            f"image_count={len(image_ids)} image_head={image_ids[:8]} image_tail={image_ids[-8:]}",
+            flush=True,
+        )
+
+    def tokens_hook(step, x, logits):
+        del logits
+        if step is None or step in log_steps:
+            summarize_x(step, x, "tokens_hook")
+        return x
+
+    def logits_hook(step, x, logits):
+        if step not in log_steps:
+            return logits
+        mask_index = x == mask_token_id
+        mask_count = int(mask_index.sum().item())
+        print(
+            f"[OD-COMPARE][official-direct] logits_hook: step={step} "
+            f"mask_count={mask_count} logits_{tensor_stats(logits)}",
+            flush=True,
+        )
+        if mask_count > 0:
+            first_mask = torch.where(mask_index[0])[0][0].item()
+            first_logits = logits[0, first_mask]
+            top_values, top_ids = torch.topk(first_logits.float(), k=12)
+            top_ids_list = top_ids.detach().cpu().tolist()
+            top_values_list = [round(float(value), 4) for value in top_values.detach().cpu().tolist()]
+            top_tokens = tokenizer.convert_ids_to_tokens(top_ids_list)
+            image_top = [
+                int(token_id - image_offset)
+                for token_id in top_ids_list
+                if image_offset <= token_id < image_offset + 8192
+            ]
+            print(
+                f"[OD-COMPARE][official-direct] logits_hook_top: step={step} "
+                f"first_mask_pos={first_mask} top_ids={top_ids_list} "
+                f"top_values={top_values_list} top_tokens={top_tokens} image_top={image_top}",
+                flush=True,
+            )
+        return logits
+
+    return tokens_hook, logits_hook
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Omni-Diffusion's remote AutoModel.generate directly inside the current Python environment."
@@ -386,6 +459,11 @@ def main() -> None:
         flush=True,
     )
 
+    tokens_hook, logits_hook = make_generation_step_hooks(
+        tokenizer,
+        mask_token_id=getattr(model.generation_config, "mask_token_id"),
+    )
+
     generate_kwargs = {}
     if args.pass_generation_config:
         generate_kwargs["generation_config"] = model.generation_config
@@ -409,6 +487,8 @@ def main() -> None:
                 repeat_penalty=args.repeat_penalty,
                 output_text_only=False,
                 task=args.task,
+                generation_tokens_hook_func=tokens_hook,
+                generation_logits_hook_func=logits_hook,
             )
     del histories
 
