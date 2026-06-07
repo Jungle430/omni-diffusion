@@ -431,6 +431,7 @@ class S2SInference:
         with allow_legacy_generation_config_validate():
             outputs, histories = self.model.generate(
                 input_ids,
+                generation_config=self.model.generation_config,
                 audios=audios,
                 audio_indices=audio_indices,
                 temperature=0.0,
