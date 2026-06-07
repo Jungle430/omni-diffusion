@@ -8,7 +8,7 @@ import time
 import uuid
 import inspect
 from threading import Thread
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import tqdm
@@ -52,6 +52,98 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 set_seed()
+
+
+def tensor_fingerprint(tensor: torch.Tensor) -> str:
+    tensor = tensor.detach()
+    flat = tensor.flatten()
+    head = [round(float(value), 6) for value in flat[:8].float().cpu().tolist()]
+    stats = tensor.float()
+    return (
+        f"shape={list(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+        f"mean={stats.mean().item():.6f} std={stats.std(unbiased=False).item():.6f} "
+        f"min={stats.min().item():.6f} max={stats.max().item():.6f} head={head}"
+    )
+
+
+def ensure_dream_rope_parameters(config: Any) -> None:
+    if getattr(config, "rope_parameters", None) is not None:
+        return
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    rope_parameters = {
+        "rope_type": "default",
+        "rope_theta": getattr(config, "rope_theta", 10000.0),
+    }
+    if rope_scaling is not None:
+        rope_parameters.update({k: v for k, v in rope_scaling.items() if k != "type"})
+        rope_parameters["rope_type"] = rope_scaling.get(
+            "rope_type",
+            rope_scaling.get("type", "default"),
+        )
+        rope_parameters.setdefault("rope_theta", getattr(config, "rope_theta", 10000.0))
+    config.rope_parameters = rope_parameters
+
+
+def make_legacy_dream_inv_freq(config: Any, device: torch.device) -> torch.Tensor:
+    ensure_dream_rope_parameters(config)
+    rope_parameters = config.rope_parameters
+    base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+    partial = rope_parameters.get(
+        "partial_rotary_factor",
+        getattr(config, "partial_rotary_factor", 1.0),
+    )
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    dim = int(head_dim * partial)
+    return 1.0 / (
+        base
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(torch.float32)
+            / dim
+        )
+    )
+
+
+def repair_dream_rope_buffers(model: Any) -> None:
+    if getattr(model.config, "model_type", None) != "Dream":
+        return
+
+    ensure_dream_rope_parameters(model.config)
+    rope_type = model.config.rope_parameters.get("rope_type", "default")
+    if rope_type != "default":
+        print(
+            "[OD-COMPARE][official] rope_compat_skip: "
+            f"unsupported rope_type={rope_type!r}",
+            flush=True,
+        )
+        return
+
+    before = model.model.rotary_emb.inv_freq
+    print(
+        "[OD-COMPARE][official] rope_compat_before: "
+        f"model.rotary_emb.inv_freq {tensor_fingerprint(before)}",
+        flush=True,
+    )
+
+    repaired = []
+    for name, module in model.named_modules():
+        current = getattr(module, "inv_freq", None)
+        if not isinstance(current, torch.Tensor):
+            continue
+        inv_freq = make_legacy_dream_inv_freq(model.config, current.device)
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        module.original_inv_freq = module.inv_freq
+        if hasattr(module, "attention_scaling"):
+            module.attention_scaling = 1.0
+        repaired.append(name)
+
+    after = model.model.rotary_emb.inv_freq
+    print(
+        "[OD-COMPARE][official] rope_compat_after: "
+        f"count={len(repaired)} names={repaired[:8]} "
+        f"model.rotary_emb.inv_freq {tensor_fingerprint(after)}",
+        flush=True,
+    )
 
 def find_audio_segments_regex(text):
     """
@@ -112,6 +204,7 @@ class S2SInference:
             f"model_source={inspect.getsourcefile(type(model))}",
             flush=True,
         )
+        repair_dream_rope_buffers(model)
 
         model.generation_config = GenerationConfig.from_pretrained(
             model_name_or_path, trust_remote_code=True
