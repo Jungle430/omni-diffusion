@@ -134,6 +134,16 @@ def ensure_default_rope() -> None:
     ROPE_INIT_FUNCTIONS["default"] = _default
 
 
+def normalize_token_ids(token_ids: Any) -> list[int]:
+    if hasattr(token_ids, "input_ids"):
+        token_ids = token_ids.input_ids
+    if isinstance(token_ids, torch.Tensor):
+        token_ids = token_ids.detach().cpu().tolist()
+    if token_ids and isinstance(token_ids[0], list):
+        token_ids = token_ids[0]
+    return [int(token_id) for token_id in token_ids]
+
+
 def repair_dream_rope_buffers(model: Any) -> None:
     if getattr(model.config, "model_type", None) != "Dream":
         return
@@ -384,6 +394,7 @@ class S2SInference:
             tokenize=True,
             add_generation_prompt=self.add_generation_prompt,
         )
+        input_ids = normalize_token_ids(input_ids)
 
         if audio_path is not None and self.audio_tokenizer.apply_to_role(
             "user", is_contiguous=True
@@ -395,6 +406,7 @@ class S2SInference:
             input_ids, audios, audio_indices = add_audio_input_contiguous(
                 input_ids, audio_paths, self.tokenizer, self.audio_tokenizer
             )
+            input_ids = normalize_token_ids(input_ids)
         else:
             audios = None
             audio_indices = None
