@@ -277,6 +277,55 @@ def tensor_fingerprint(tensor: torch.Tensor) -> str:
     )
 
 
+def make_legacy_dream_inv_freq(config: Any, device: torch.device) -> torch.Tensor:
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+    partial = rope_parameters.get(
+        "partial_rotary_factor",
+        getattr(config, "partial_rotary_factor", 1.0),
+    )
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    dim = int(head_dim * partial)
+    return 1.0 / (
+        base
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(torch.float32)
+            / dim
+        )
+    )
+
+
+def repair_dream_rope_buffers(model: Any) -> None:
+    before = get_nested_attr(model, "model.rotary_emb.inv_freq")
+    print(
+        "[OD-COMPARE][official-direct] rope_repair_before: "
+        f"model.rotary_emb.inv_freq {tensor_fingerprint(before)}",
+        flush=True,
+    )
+
+    repaired = []
+    for name, module in model.named_modules():
+        if not hasattr(module, "inv_freq"):
+            continue
+        current = module.inv_freq
+        if not isinstance(current, torch.Tensor):
+            continue
+        inv_freq = make_legacy_dream_inv_freq(model.config, current.device)
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        module.original_inv_freq = module.inv_freq
+        if hasattr(module, "attention_scaling"):
+            module.attention_scaling = 1.0
+        repaired.append(name)
+
+    after = get_nested_attr(model, "model.rotary_emb.inv_freq")
+    print(
+        "[OD-COMPARE][official-direct] rope_repair_after: "
+        f"count={len(repaired)} names={repaired[:8]} "
+        f"model.rotary_emb.inv_freq {tensor_fingerprint(after)}",
+        flush=True,
+    )
+
+
 def log_model_fingerprints(model: Any) -> None:
     model_source = inspect.getsourcefile(type(model))
     prepare_source = inspect.getsourcefile(model._prepare_generation_config)
@@ -466,6 +515,8 @@ def main() -> None:
     model.generation_config.top_p = 1.0
     model.generation_config.num_beams = 1
     model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+    repair_dream_rope_buffers(model)
 
     if not args.no_debug_hooks:
         install_generation_debug_hooks(model)
