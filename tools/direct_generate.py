@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import random
 import re
@@ -250,6 +251,71 @@ def tensor_stats(tensor: torch.Tensor) -> str:
     )
 
 
+def file_sha256(path: str | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_nested_attr(obj: Any, path: str) -> Any:
+    current = obj
+    for part in path.split("."):
+        current = getattr(current, part)
+    return current
+
+
+def tensor_fingerprint(tensor: torch.Tensor) -> str:
+    tensor = tensor.detach()
+    flat = tensor.flatten()
+    head = [round(float(value), 6) for value in flat[:8].float().cpu().tolist()]
+    stats = tensor.float()
+    return (
+        f"shape={list(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+        f"mean={stats.mean().item():.6f} std={stats.std(unbiased=False).item():.6f} "
+        f"min={stats.min().item():.6f} max={stats.max().item():.6f} head={head}"
+    )
+
+
+def log_model_fingerprints(model: Any) -> None:
+    model_source = inspect.getsourcefile(type(model))
+    prepare_source = inspect.getsourcefile(model._prepare_generation_config)
+    sample_source = inspect.getsourcefile(model._sample)
+    print(
+        "[OD-COMPARE][official-direct] source_hashes: "
+        f"modeling={file_sha256(model_source)} "
+        f"generation_prepare={file_sha256(prepare_source)} "
+        f"generation_sample={file_sha256(sample_source)}",
+        flush=True,
+    )
+    print(
+        "[OD-COMPARE][official-direct] model_impl: "
+        f"attn_impl={getattr(model.config, '_attn_implementation', None)!r} "
+        f"layer0_attn={type(model.model.layers[0].self_attn).__module__}."
+        f"{type(model.model.layers[0].self_attn).__name__}",
+        flush=True,
+    )
+    for name in (
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.rotary_emb.inv_freq",
+    ):
+        value = get_nested_attr(model, name)
+        print(
+            "[OD-COMPARE][official-direct] model_param: "
+            f"{name} {tensor_fingerprint(value)}",
+            flush=True,
+        )
+
+
 def make_generation_step_hooks(tokenizer: Any, mask_token_id: int):
     image_offset = tokenizer.convert_tokens_to_ids("<|image_0|>")
     log_steps = {0, 1}
@@ -446,6 +512,7 @@ def main() -> None:
         f"mask_token_id={getattr(model.generation_config, 'mask_token_id', None)}",
         flush=True,
     )
+    log_model_fingerprints(model)
     print(
         "[OD-COMPARE][official-direct] generate_start: "
         f"prompt_tokens={input_ids.shape[1]} task={args.task!r} steps={args.steps} "
