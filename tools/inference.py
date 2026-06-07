@@ -7,6 +7,7 @@ import sys
 import time
 import uuid
 import inspect
+from contextlib import contextmanager
 from threading import Thread
 from typing import Any, Optional
 
@@ -53,6 +54,26 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 set_seed()
+
+
+@contextmanager
+def allow_legacy_generation_config_validate():
+    original_update = GenerationConfig.update
+
+    def legacy_update(self: GenerationConfig, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return original_update(self, **kwargs)
+        except TypeError as exc:
+            if "validate() got an unexpected keyword argument 'user_set_attributes'" not in str(exc):
+                raise
+            self.validate()
+            return {key: value for key, value in kwargs.items() if not hasattr(self, key)}
+
+    GenerationConfig.update = legacy_update
+    try:
+        yield
+    finally:
+        GenerationConfig.update = original_update
 
 
 def tensor_fingerprint(tensor: torch.Tensor) -> str:
@@ -198,13 +219,14 @@ class S2SInference:
         print(f"{tokenizer.get_chat_template()=}")
 
         ensure_default_rope()
-        model = AutoModel.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=True,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
-            attn_implementation="eager",
-        ).eval()
+        with allow_legacy_generation_config_validate():
+            model = AutoModel.from_pretrained(
+                model_name_or_path,
+                trust_remote_code=True,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+                attn_implementation="eager",
+            ).eval()
         # print("model", model)
         print(f"{model.config.model_type=}")
         print(f"{model.hf_device_map=}")
@@ -216,9 +238,10 @@ class S2SInference:
         )
         repair_dream_rope_buffers(model)
 
-        model.generation_config = GenerationConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=True
-        )
+        with allow_legacy_generation_config_validate():
+            model.generation_config = GenerationConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=True
+            )
 
         model.generation_config.max_new_tokens = 8192
         model.generation_config.chat_format = "chatml"
