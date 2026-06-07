@@ -15,6 +15,7 @@ import tqdm
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, AutoModel
 from transformers.generation import GenerationConfig
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 import torchaudio
 from omni_diffusion.data.processor.audio_processor import add_audio_input_contiguous
@@ -104,6 +105,14 @@ def make_legacy_dream_inv_freq(config: Any, device: torch.device) -> torch.Tenso
     )
 
 
+def ensure_default_rope() -> None:
+    def _default(config, device=None, seq_len=None, **_):
+        del seq_len
+        return make_legacy_dream_inv_freq(config, device), 1.0
+
+    ROPE_INIT_FUNCTIONS["default"] = _default
+
+
 def repair_dream_rope_buffers(model: Any) -> None:
     if getattr(model.config, "model_type", None) != "Dream":
         return
@@ -188,6 +197,7 @@ class S2SInference:
         # print(f"{tokenizer=}")
         print(f"{tokenizer.get_chat_template()=}")
 
+        ensure_default_rope()
         model = AutoModel.from_pretrained(
             model_name_or_path,
             trust_remote_code=True,
