@@ -102,9 +102,6 @@ def allow_legacy_generation_config_validate():
 
 
 def ensure_default_rope() -> None:
-    if "default" in ROPE_INIT_FUNCTIONS:
-        return
-
     def _default(config, device=None, seq_len=None, **_):
         del seq_len
         rope_parameters = getattr(config, "rope_parameters", None) or {}
