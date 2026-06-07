@@ -148,6 +148,94 @@ def normalize_token_ids(token_ids: Any) -> list[int]:
     return [int(token_id) for token_id in token_ids]
 
 
+def format_debug_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() <= 8:
+            return value.detach().cpu().tolist()
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    return value
+
+
+def summarize_generation_config(config: Any) -> str:
+    fields = (
+        "max_length",
+        "max_new_tokens",
+        "eps",
+        "steps",
+        "alg",
+        "alg_temp",
+        "temperature",
+        "top_p",
+        "top_k",
+        "num_return_sequences",
+        "return_dict_in_generate",
+        "output_history",
+        "do_sample",
+        "num_beams",
+        "use_cache",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "mask_token_id",
+        "_bos_token_tensor",
+        "_eos_token_tensor",
+        "_pad_token_tensor",
+        "_mask_token_tensor",
+    )
+    parts = [f"type={type(config).__name__}"]
+    for field in fields:
+        parts.append(f"{field}={format_debug_value(getattr(config, field, None))!r}")
+    return " ".join(parts)
+
+
+def install_generation_debug_hooks(model: Any) -> None:
+    original_prepare = model._prepare_generation_config
+    original_sample = model._sample
+
+    def prepare_wrapper(generation_config=None, **kwargs):
+        print(
+            "[OD-COMPARE][official-direct] prepare_generation_config_input: "
+            f"generation_config={summarize_generation_config(generation_config) if generation_config is not None else None} "
+            f"kwargs_keys={sorted(kwargs)} "
+            f"kwargs_subset={{{', '.join(f'{key}={kwargs[key]!r}' for key in sorted(kwargs) if key in {'max_new_tokens', 'steps', 'temperature', 'top_p', 'alg_temp', 'output_history', 'return_dict_in_generate'})}}}",
+            flush=True,
+        )
+        try:
+            prepared = original_prepare(generation_config, **kwargs)
+        except Exception as exc:
+            print(
+                "[OD-COMPARE][official-direct] prepare_generation_config_error: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise
+        print(
+            "[OD-COMPARE][official-direct] prepare_generation_config_output: "
+            f"{summarize_generation_config(prepared)}",
+            flush=True,
+        )
+        return prepared
+
+    def sample_wrapper(*args, **kwargs):
+        generation_config = kwargs.get("generation_config")
+        if generation_config is None and len(args) >= 3:
+            generation_config = args[2]
+        print(
+            "[OD-COMPARE][official-direct] sample_input: "
+            f"{summarize_generation_config(generation_config)} "
+            f"kwargs_subset={{{', '.join(f'{key}={kwargs[key]!r}' for key in sorted(kwargs) if key in {'alg', 'block_size', 'cfg', 'add_boa_token', 'max_position_penalty', 'repeat_penalty'})}}}",
+            flush=True,
+        )
+        return original_sample(*args, **kwargs)
+
+    model._prepare_generation_config = prepare_wrapper
+    model._sample = sample_wrapper
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Omni-Diffusion's remote AutoModel.generate directly inside the current Python environment."
@@ -173,6 +261,11 @@ def parse_args() -> argparse.Namespace:
         "--pass-generation-config",
         action="store_true",
         help="Pass model.generation_config to generate(). The official inference script does not do this by default.",
+    )
+    parser.add_argument(
+        "--no-debug-hooks",
+        action="store_true",
+        help="Disable OD-COMPARE hooks around Dream generation config preparation and sampling.",
     )
     return parser.parse_args()
 
@@ -237,6 +330,9 @@ def main() -> None:
     model.generation_config.top_p = 1.0
     model.generation_config.num_beams = 1
     model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+    if not args.no_debug_hooks:
+        install_generation_debug_hooks(model)
 
     prompt_token_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": args.prompt}],
