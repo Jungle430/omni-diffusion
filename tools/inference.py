@@ -246,12 +246,30 @@ class S2SInference:
             f"model_source={inspect.getsourcefile(type(model))}",
             flush=True,
         )
-        repair_dream_rope_buffers(model)
-
         with allow_legacy_generation_config_validate():
             model.generation_config = GenerationConfig.from_pretrained(
                 model_name_or_path, trust_remote_code=True
             )
+
+        for token_name in ("bos_token_id", "eos_token_id", "pad_token_id", "mask_token_id"):
+            if getattr(model.generation_config, token_name, None) is not None:
+                continue
+            token_id = getattr(model.config, token_name, None)
+            if token_id is None:
+                token_id = getattr(tokenizer, token_name, None)
+            if token_id is not None:
+                setattr(model.generation_config, token_name, token_id)
+
+        for name, value in {
+            "eps": 1e-3,
+            "steps": 512,
+            "alg": "origin",
+            "alg_temp": None,
+            "num_return_sequences": 1,
+            "return_dict_in_generate": False,
+            "output_history": False,
+        }.items():
+            setattr(model.generation_config, name, value)
 
         model.generation_config.max_new_tokens = 8192
         model.generation_config.chat_format = "chatml"
@@ -264,6 +282,7 @@ class S2SInference:
         model.generation_config.top_p = 1.0
         model.generation_config.num_beams = 1
         model.generation_config.pad_token_id = tokenizer.pad_token_id
+        repair_dream_rope_buffers(model)
         print(f"{model.generation_config=}")
 
         audio_tokenizer = get_audio_tokenizer(
