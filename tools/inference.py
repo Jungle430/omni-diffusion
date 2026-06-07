@@ -229,7 +229,7 @@ class S2SInference:
             ).eval()
         # print("model", model)
         print(f"{model.config.model_type=}")
-        print(f"{model.hf_device_map=}")
+        print(f"model.hf_device_map={getattr(model, 'hf_device_map', None)!r}")
         print(
             "[OD-COMPARE][official] model_source: "
             f"model_class={type(model).__module__}.{type(model).__name__} "
