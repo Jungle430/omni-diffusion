@@ -428,23 +428,24 @@ class S2SInference:
             f"prompt_tail={prompt_token_ids_cpu[-12:].tolist()} prompt_preview={prompt_preview!r}",
             flush=True,
         )
-        outputs, histories = self.model.generate(
-            input_ids,
-            audios=audios,
-            audio_indices=audio_indices,
-            temperature=0.0,
-            top_p=0.9,  
-            steps=steps,
-            max_new_tokens = max_tokens,
-            alg=alg,
-            cfg=cfg,
-            tokenizer=self.tokenizer,
-            add_boa_token=add_boa_token,
-            max_position_penalty=max_position_penalty,
-            repeat_penalty=repeat_penalty,
-            output_text_only=output_text_only,
-            task=task,
-        )
+        with allow_legacy_generation_config_validate():
+            outputs, histories = self.model.generate(
+                input_ids,
+                audios=audios,
+                audio_indices=audio_indices,
+                temperature=0.0,
+                top_p=0.9,
+                steps=steps,
+                max_new_tokens=max_tokens,
+                alg=alg,
+                cfg=cfg,
+                tokenizer=self.tokenizer,
+                add_boa_token=add_boa_token,
+                max_position_penalty=max_position_penalty,
+                repeat_penalty=repeat_penalty,
+                output_text_only=output_text_only,
+                task=task,
+            )
 
         generated_token_ids = outputs[0][input_ids.shape[1]:]
         generated_token_ids_cpu = generated_token_ids.detach().cpu()
