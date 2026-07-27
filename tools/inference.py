@@ -7,7 +7,7 @@ import sys
 import time
 import uuid
 import inspect
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from threading import Thread
 from typing import Any, Optional
 
@@ -28,6 +28,8 @@ import random
 import numpy as np
 import torchaudio
 import argparse
+
+from generation_diagnostics import GenerationDiagnostics
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -208,7 +210,13 @@ def extract_token_ids_as_int(text):
 
 class S2SInference:
     def __init__(
-        self, model_name_or_path, audio_tokenizer_path, audio_tokenizer_type, image_tokenizer_path, flow_path=None,
+        self,
+        model_name_or_path,
+        audio_tokenizer_path,
+        audio_tokenizer_type,
+        image_tokenizer_path,
+        flow_path=None,
+        diagnostics=None,
     ):
 
         config = AutoConfig.from_pretrained(
@@ -284,6 +292,8 @@ class S2SInference:
         model.generation_config.pad_token_id = tokenizer.pad_token_id
         repair_dream_rope_buffers(model)
         print(f"{model.generation_config=}")
+        if diagnostics is not None:
+            diagnostics.install(model)
 
         audio_tokenizer = get_audio_tokenizer(
             audio_tokenizer_path,
@@ -307,6 +317,7 @@ class S2SInference:
         self.add_generation_prompt = add_generation_prompt
         self.default_system_message = default_system_message
         self.image_processor = image_processor
+        self.diagnostics = diagnostics
         self.image_processor.image_tokenizer.rank = 0
         self.image_processor.load_model()
 
@@ -328,6 +339,16 @@ class S2SInference:
         repeat_penalty=1.0,
         output_text_only=False,
     ):
+        if self.diagnostics is not None:
+            self.diagnostics.start_request(
+                task=task,
+                max_tokens=max_tokens,
+                steps=steps,
+                alg=alg,
+                cfg=cfg,
+                max_position_penalty=max_position_penalty,
+                repeat_penalty=repeat_penalty,
+            )
 
         AUD_TAG_TOKEN = "<|audio|>"
         AUD_CONTEXT_TOKEN = "<|context_of_audio|>"
@@ -389,15 +410,24 @@ class S2SInference:
 
         if audio_path is not None and self.audio_tokenizer.apply_to_role("user", is_discrete=True):
             # discrete codec
-            audio_tokens = self.audio_tokenizer.encode(audio_path)
+            if self.diagnostics is None:
+                audio_tokens = self.audio_tokenizer.encode(audio_path)
+            else:
+                with self.diagnostics.stage("audio_tokenizer_encode"):
+                    audio_tokens = self.audio_tokenizer.encode(audio_path)
             audio_tokens = "".join(f"<|audio_{i}|>" for i in audio_tokens)
             messages[-1]["content"] = messages[-1]["content"].replace(
                 "<|audio|>", f"<|begin_of_audio|>{audio_tokens}<|end_of_audio|>"
             )
         
         if image_path is not None:
-            image_tokens = self.image_processor.process_images_with_subpatch(image_path, 512)
-            image_tokens = self.image_processor.get_image_token(image_tokens)
+            if self.diagnostics is None:
+                image_tokens = self.image_processor.process_images_with_subpatch(image_path, 512)
+                image_tokens = self.image_processor.get_image_token(image_tokens)
+            else:
+                with self.diagnostics.stage("image_tokenizer_encode"):
+                    image_tokens = self.image_processor.process_images_with_subpatch(image_path, 512)
+                    image_tokens = self.image_processor.get_image_token(image_tokens)
             image_tokens = image_tokens[0].tolist()
             image_tokens = "".join(f"<|image_{i}|>" for i in image_tokens)
 
@@ -408,11 +438,19 @@ class S2SInference:
                 "<|image|>", f"{IMG_START_TOKEN}{image_tokens}{IMG_END_TOKEN}"
             )
 
-        input_ids = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=self.add_generation_prompt,
-        )
+        if self.diagnostics is None:
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=self.add_generation_prompt,
+            )
+        else:
+            with self.diagnostics.stage("prompt_tokenize", record_cuda=False):
+                input_ids = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=self.add_generation_prompt,
+                )
         input_ids = normalize_token_ids(input_ids)
 
         if audio_path is not None and self.audio_tokenizer.apply_to_role(
@@ -422,15 +460,28 @@ class S2SInference:
             audio_paths = []
             if audio_path is not None:
                 audio_paths.append(audio_path)
-            input_ids, audios, audio_indices = add_audio_input_contiguous(
-                input_ids, audio_paths, self.tokenizer, self.audio_tokenizer
-            )
+            if self.diagnostics is None:
+                input_ids, audios, audio_indices = add_audio_input_contiguous(
+                    input_ids, audio_paths, self.tokenizer, self.audio_tokenizer
+                )
+            else:
+                with self.diagnostics.stage(
+                    "audio_input_prepare",
+                    record_cuda=False,
+                ):
+                    input_ids, audios, audio_indices = add_audio_input_contiguous(
+                        input_ids, audio_paths, self.tokenizer, self.audio_tokenizer
+                    )
             input_ids = normalize_token_ids(input_ids)
         else:
             audios = None
             audio_indices = None
 
-        input_ids = torch.tensor([input_ids], dtype=torch.long).to("cuda")
+        if self.diagnostics is None:
+            input_ids = torch.tensor([input_ids], dtype=torch.long).to("cuda")
+        else:
+            with self.diagnostics.stage("input_to_device"):
+                input_ids = torch.tensor([input_ids], dtype=torch.long).to("cuda")
         
         print("input", self.tokenizer.decode(input_ids[0], skip_special_tokens=False), flush=True)
         prompt_token_ids_cpu = input_ids[0].detach().cpu()
@@ -447,25 +498,40 @@ class S2SInference:
             f"prompt_tail={prompt_token_ids_cpu[-12:].tolist()} prompt_preview={prompt_preview!r}",
             flush=True,
         )
-        with allow_legacy_generation_config_validate():
-            outputs, histories = self.model.generate(
-                input_ids,
-                generation_config=self.model.generation_config,
-                audios=audios,
-                audio_indices=audio_indices,
-                temperature=0.0,
-                top_p=0.9,
-                steps=steps,
-                max_new_tokens=max_tokens,
-                alg=alg,
-                cfg=cfg,
-                tokenizer=self.tokenizer,
-                add_boa_token=add_boa_token,
-                max_position_penalty=max_position_penalty,
-                repeat_penalty=repeat_penalty,
-                output_text_only=output_text_only,
-                task=task,
-            )
+        generation_hooks = {}
+        if self.diagnostics is not None:
+            tokens_hook, logits_hook = self.diagnostics.wrap_generation_hooks()
+            generation_hooks = {
+                "generation_tokens_hook_func": tokens_hook,
+                "generation_logits_hook_func": logits_hook,
+            }
+
+        generation_stage = (
+            self.diagnostics.stage("generate_total")
+            if self.diagnostics is not None
+            else nullcontext()
+        )
+        with generation_stage:
+            with allow_legacy_generation_config_validate():
+                outputs, histories = self.model.generate(
+                    input_ids,
+                    generation_config=self.model.generation_config,
+                    audios=audios,
+                    audio_indices=audio_indices,
+                    temperature=0.0,
+                    top_p=0.9,
+                    steps=steps,
+                    max_new_tokens=max_tokens,
+                    alg=alg,
+                    cfg=cfg,
+                    tokenizer=self.tokenizer,
+                    add_boa_token=add_boa_token,
+                    max_position_penalty=max_position_penalty,
+                    repeat_penalty=repeat_penalty,
+                    output_text_only=output_text_only,
+                    task=task,
+                    **generation_hooks,
+                )
 
         generated_token_ids = outputs[0][input_ids.shape[1]:]
         generated_token_ids_cpu = generated_token_ids.detach().cpu()
@@ -515,9 +581,15 @@ class S2SInference:
             )
 
         if len(audio_tokens) > 0:
-            tts_speech = self.audio_tokenizer.decode(
-                audio_tokens, source_speech_16k=None
-            )
+            if self.diagnostics is None:
+                tts_speech = self.audio_tokenizer.decode(
+                    audio_tokens, source_speech_16k=None
+                )
+            else:
+                with self.diagnostics.stage("audio_tokenizer_decode"):
+                    tts_speech = self.audio_tokenizer.decode(
+                        audio_tokens, source_speech_16k=None
+                    )
         else:
             tts_speech = None
 
@@ -535,7 +607,15 @@ class S2SInference:
                 f"head={gen_token_ids_cpu[:8].tolist()} tail={gen_token_ids_cpu[-8:].tolist()}",
                 flush=True,
             )
-            image = self.image_processor.image_tokenizer.image_tokenizer.decode_code(gen_token_ids[:, :256]) 
+            if self.diagnostics is None:
+                image = self.image_processor.image_tokenizer.image_tokenizer.decode_code(
+                    gen_token_ids[:, :256]
+                )
+            else:
+                with self.diagnostics.stage("image_tokenizer_decode"):
+                    image = self.image_processor.image_tokenizer.image_tokenizer.decode_code(
+                        gen_token_ids[:, :256]
+                    )
             image = torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
             print(
                 "[OD-COMPARE][official] decoded_image: "
@@ -738,6 +818,35 @@ if __name__ == "__main__":
         "--image_tokenizer_path", type=str, default="showlab/magvitv2"
     )
     parser.add_argument("--flow_path", type=str, default="THUDM/glm-4-voice-decoder")
+    parser.add_argument(
+        "--task",
+        choices=("t2i", "vqa", "asr", "tts", "s2i", "svqa"),
+        default="t2i",
+        help="Run one official example task instead of editing this script.",
+    )
+    parser.add_argument("--max_tokens", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--alg", type=str, default=None)
+    parser.add_argument("--repeat_penalty", type=float, default=None)
+    diagnostics_group = parser.add_mutually_exclusive_group()
+    diagnostics_group.add_argument(
+        "--profile_json",
+        type=str,
+        default=None,
+        help="Write CUDA-event and CPU stage timings to this JSON file.",
+    )
+    diagnostics_group.add_argument(
+        "--trace_jsonl",
+        type=str,
+        default=None,
+        help="Write a compact per-step golden trace to this JSONL file.",
+    )
+    parser.add_argument(
+        "--trace_topk",
+        type=int,
+        default=8,
+        help="Number of logits entries retained for sampled active rows.",
+    )
 
     args = parser.parse_args()
 
@@ -753,13 +862,78 @@ if __name__ == "__main__":
 
     os.makedirs(output_path, exist_ok=True)
 
-    s2s_inference = S2SInference(
-        model_name_or_path, audio_tokenizer_path, audio_tokenizer_type, image_tokenizer_path, flow_path=flow_path,
-    )
-    
-    images = None
-    speech = None
+    diagnostics = None
+    if args.profile_json or args.trace_jsonl:
+        diagnostics = GenerationDiagnostics(
+            profile_path=args.profile_json,
+            trace_path=args.trace_jsonl,
+            trace_topk=args.trace_topk,
+        )
 
-    # text-to-image
-    output, images = t2i_task(s2s_inference, 260, 260, "entropy-penalty", 1.2)
-    save_output(output_path, "t2i", output, images, None)
+    s2s_inference = S2SInference(
+        model_name_or_path,
+        audio_tokenizer_path,
+        audio_tokenizer_type,
+        image_tokenizer_path,
+        flow_path=flow_path,
+        diagnostics=diagnostics,
+    )
+
+    task_defaults = {
+        "t2i": (260, 260, "entropy-penalty", 1.2),
+        "vqa": (64, 64, "entropy", 1.0),
+        "asr": (25, 25, "entropy", 1.0),
+        "tts": (50, 50, "entropy", 1.0),
+        "s2i": (260, 260, "entropy-penalty", 1.2),
+        "svqa": (64, 64, "entropy", 1.0),
+    }
+    max_tokens, steps, alg, repeat_penalty = task_defaults[args.task]
+    max_tokens = args.max_tokens if args.max_tokens is not None else max_tokens
+    steps = args.steps if args.steps is not None else steps
+    alg = args.alg if args.alg is not None else alg
+    repeat_penalty = (
+        args.repeat_penalty
+        if args.repeat_penalty is not None
+        else repeat_penalty
+    )
+
+    if args.task == "t2i":
+        output, images = t2i_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        save_output(output_path, args.task, output, images, None)
+    elif args.task == "vqa":
+        output = vqa_task(s2s_inference, max_tokens, steps, alg, repeat_penalty)
+        save_output(output_path, args.task, output, None, None)
+    elif args.task == "asr":
+        output = asr_task(s2s_inference, max_tokens, steps, alg, repeat_penalty)
+        save_output(output_path, args.task, output, None, None)
+    elif args.task == "tts":
+        output, speech = tts_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        save_output(output_path, args.task, output, None, speech)
+    elif args.task == "s2i":
+        output, images = s2i_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        save_output(output_path, args.task, output, images, None)
+    else:
+        output, speech = svqa_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        save_output(output_path, args.task, output, None, speech)
+
+    if diagnostics is not None:
+        diagnostics.close(
+            {
+                "task": args.task,
+                "model_name_or_path": model_name_or_path,
+                "max_tokens": max_tokens,
+                "steps": steps,
+                "alg": alg,
+                "repeat_penalty": repeat_penalty,
+                "torch": torch.__version__,
+                "torch_cuda": torch.version.cuda,
+            }
+        )
