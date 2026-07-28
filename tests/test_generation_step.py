@@ -22,6 +22,7 @@ GENERATION_UTILS = importlib.util.module_from_spec(MODULE_SPEC)
 sys.modules[MODULE_SPEC.name] = GENERATION_UTILS
 MODULE_SPEC.loader.exec_module(GENERATION_UTILS)
 DreamGenerationMixin = GENERATION_UTILS.DreamGenerationMixin
+DreamGenerationContext = GENERATION_UTILS.DreamGenerationContext
 DreamGenerationState = GENERATION_UTILS.DreamGenerationState
 
 
@@ -106,8 +107,7 @@ def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
         hook_calls.append(("tokens", step, x.clone()))
         return x.clone()
 
-    logits = model._denoise_step(
-        state=state,
+    context = DreamGenerationContext(
         input_ids=torch.tensor([[1]]),
         attention_mask=None,
         inputs_embeds=None,
@@ -123,6 +123,10 @@ def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
         repeat_penalty=1,
         generation_tokens_hook_func=tokens_hook,
         generation_logits_hook_func=logits_hook,
+    )
+    logits = model._denoise_step(
+        state=state,
+        context=context,
     )
     state.record_step(logits)
 

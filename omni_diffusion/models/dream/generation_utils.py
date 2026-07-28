@@ -16,7 +16,7 @@
 import warnings
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributions as dists
@@ -151,6 +151,31 @@ class DreamGenerationState:
             self.histories.append(self.x.clone())
             self.all_logits.append(torch.max(logits.clone(), -1)[-1])
         self.global_step += 1
+
+
+@dataclass(frozen=True)
+class DreamGenerationContext:
+    input_ids: torch.LongTensor
+    attention_mask: Optional[torch.Tensor]
+    inputs_embeds: Optional[torch.Tensor]
+    tok_idx: Optional[torch.Tensor]
+    un_x: Optional[list[int]]
+    cfg: float
+    alg: str
+    alg_temp: Optional[float]
+    temperature: float
+    top_p: Optional[float]
+    top_k: Optional[int]
+    max_position_penalty: float
+    repeat_penalty: float
+    generation_tokens_hook_func: Callable[
+        [Optional[int], torch.Tensor, Optional[torch.Tensor]],
+        torch.Tensor,
+    ]
+    generation_logits_hook_func: Callable[
+        [int, torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -454,7 +479,7 @@ class DreamGenerationMixin:
         histories,
         all_logits,
         generation_tokens_hook_func,
-    ):
+    ) -> tuple[DreamGenerationState, torch.LongTensor]:
         if input_ids is None:
             assert device is not None
             assert inputs_embeds is not None
@@ -480,29 +505,17 @@ class DreamGenerationMixin:
         return state, input_ids
 
     @staticmethod
-    def _finalize_generation_state(state: DreamGenerationState):
+    def _finalize_generation_state(
+        state: DreamGenerationState,
+    ) -> tuple[torch.LongTensor, Optional[list[torch.LongTensor]]]:
         return state.x, state.histories
 
     def _denoise_step(
         self,
         *,
         state: DreamGenerationState,
-        input_ids,
-        attention_mask,
-        inputs_embeds,
-        tok_idx,
-        un_x,
-        cfg,
-        alg,
-        alg_temp,
-        temperature,
-        top_p,
-        top_k,
-        max_position_penalty,
-        repeat_penalty,
-        generation_tokens_hook_func,
-        generation_logits_hook_func,
-    ):
+        context: DreamGenerationContext,
+    ) -> torch.Tensor:
         x = state.x
         mask_index = state.mask_index
         step = state.step
@@ -511,6 +524,21 @@ class DreamGenerationMixin:
         block_mask = state.block_mask
         histories = state.histories
         mask_token_id = state.mask_token_id
+        input_ids = context.input_ids
+        attention_mask = context.attention_mask
+        inputs_embeds = context.inputs_embeds
+        tok_idx = context.tok_idx
+        un_x = context.un_x
+        cfg = context.cfg
+        alg = context.alg
+        alg_temp = context.alg_temp
+        temperature = context.temperature
+        top_p = context.top_p
+        top_k = context.top_k
+        max_position_penalty = context.max_position_penalty
+        repeat_penalty = context.repeat_penalty
+        generation_tokens_hook_func = context.generation_tokens_hook_func
+        generation_logits_hook_func = context.generation_logits_hook_func
 
         inputs_embeds_curr = self.model.embed_tokens(x)
 
@@ -759,6 +787,24 @@ class DreamGenerationMixin:
                                                   text description.\n") 
                 un_x = un_x + un_x_text + kwargs['tokenizer'].encode("<|im_end|>\n<|im_start|>assistant\n")
 
+        context = DreamGenerationContext(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            tok_idx=tok_idx,
+            un_x=un_x,
+            cfg=cfg,
+            alg=alg,
+            alg_temp=alg_temp,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_position_penalty=max_position_penalty,
+            repeat_penalty=repeat_penalty,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
+        )
+
         for block_idx in range(block_num):
             block_mask = torch.zeros([state.x.shape[-1]]).to(torch.bool).to(state.x.device)
             block_mask[input_length + block_idx * block_size: input_length + (block_idx + 1) * block_size] = True
@@ -775,21 +821,7 @@ class DreamGenerationMixin:
                 if mask_index.sum() == 0: break
                 logits = self._denoise_step(
                     state=state,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    inputs_embeds=inputs_embeds,
-                    tok_idx=tok_idx,
-                    un_x=un_x,
-                    cfg=cfg,
-                    alg=alg,
-                    alg_temp=alg_temp,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    max_position_penalty=max_position_penalty,
-                    repeat_penalty=repeat_penalty,
-                    generation_tokens_hook_func=generation_tokens_hook_func,
-                    generation_logits_hook_func=generation_logits_hook_func,
+                    context=context,
                 )
                 state.record_step(logits)
 
