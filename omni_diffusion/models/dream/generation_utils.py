@@ -440,6 +440,49 @@ class DreamGenerationMixin:
         )
         return result
 
+    def _initialize_generation_state(
+        self,
+        *,
+        input_ids,
+        inputs_embeds,
+        device,
+        max_length,
+        max_new_tokens,
+        steps,
+        eps,
+        mask_token_id,
+        histories,
+        all_logits,
+        generation_tokens_hook_func,
+    ):
+        if input_ids is None:
+            assert device is not None
+            assert inputs_embeds is not None
+            bsz, seq_len = inputs_embeds.shape[:2]
+            max_length = seq_len + max_new_tokens
+            input_ids = torch.full((bsz, seq_len), 0, dtype=torch.long).to(device)
+
+        x = F.pad(
+            input_ids,
+            (0, max_length - input_ids.shape[1]),
+            value=mask_token_id,
+        )
+        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+        x = generation_tokens_hook_func(None, x, None)
+        state = DreamGenerationState(
+            x=x,
+            mask_token_id=mask_token_id,
+            histories=histories,
+            all_logits=all_logits,
+            steps=steps,
+            timesteps=timesteps,
+        )
+        return state, input_ids
+
+    @staticmethod
+    def _finalize_generation_state(state: DreamGenerationState):
+        return state.x, state.histories
+
     def _denoise_step(
         self,
         *,
@@ -663,28 +706,22 @@ class DreamGenerationMixin:
         generated_tokens = []
         block_size = max_new_tokens if block_size < 0 else block_size
 
-        if input_ids is None:
-            assert device is not None
-            assert inputs_embeds is not None
-            bsz, seq_len = inputs_embeds.shape[:2]                  
-            max_length = seq_len + max_new_tokens                   
-            input_ids = torch.full((bsz, seq_len), 0, dtype=torch.long).to(device)
-
-        tok_idx = None
-        past_key_values = None
-
-        x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id) 
-
-        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
-        x = generation_tokens_hook_func(None, x, None)
-        state = DreamGenerationState(
-            x=x,
+        state, input_ids = self._initialize_generation_state(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            device=device,
+            max_length=max_length,
+            max_new_tokens=max_new_tokens,
+            steps=steps,
+            eps=eps,
             mask_token_id=mask_token_id,
             histories=histories,
             all_logits=all_logit,
-            steps=steps,
-            timesteps=timesteps,
+            generation_tokens_hook_func=generation_tokens_hook_func,
         )
+
+        tok_idx = None
+        past_key_values = None
 
         if step_ratio is not None:
             steps = int(max_new_tokens * step_ratio)
@@ -756,4 +793,4 @@ class DreamGenerationMixin:
                 )
                 state.record_step(logits)
 
-        return (state.x, state.histories)
+        return self._finalize_generation_state(state)

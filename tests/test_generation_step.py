@@ -44,6 +44,40 @@ class DummyDreamGenerationModel(DreamGenerationMixin):
         return SimpleNamespace(logits=logits)
 
 
+def test_generation_state_initialization_and_finalization():
+    model = DummyDreamGenerationModel()
+    initial_hook_calls = []
+
+    def initial_hook(step, x, logits):
+        initial_hook_calls.append((step, x.clone(), logits))
+        return x.clone()
+
+    state, input_ids = model._initialize_generation_state(
+        input_ids=torch.tensor([[1, 2]]),
+        inputs_embeds=None,
+        device=torch.device("cpu"),
+        max_length=4,
+        max_new_tokens=2,
+        steps=2,
+        eps=0.001,
+        mask_token_id=9,
+        histories=[],
+        all_logits=[],
+        generation_tokens_hook_func=initial_hook,
+    )
+
+    assert input_ids.tolist() == [[1, 2]]
+    assert state.x.tolist() == [[1, 2, 9, 9]]
+    assert state.timesteps.shape == (3,)
+    assert initial_hook_calls[0][0] is None
+    assert initial_hook_calls[0][1].tolist() == [[1, 2, 9, 9]]
+    assert initial_hook_calls[0][2] is None
+
+    sequences, histories = model._finalize_generation_state(state)
+    assert sequences is state.x
+    assert histories is state.histories
+
+
 def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
     model = DummyDreamGenerationModel()
     token_ids = torch.tensor([[1, 9, 9]])
