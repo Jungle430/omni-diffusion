@@ -401,6 +401,188 @@ class DreamGenerationMixin:
         )
         return result
 
+    def _denoise_step(
+        self,
+        *,
+        x,
+        mask_index,
+        input_ids,
+        attention_mask,
+        inputs_embeds,
+        tok_idx,
+        un_x,
+        cfg,
+        step,
+        steps,
+        timesteps,
+        block_mask,
+        alg,
+        alg_temp,
+        temperature,
+        top_p,
+        top_k,
+        max_position_penalty,
+        repeat_penalty,
+        histories,
+        mask_token_id,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
+    ):
+        inputs_embeds_curr = self.model.embed_tokens(x)
+
+        if inputs_embeds is not None:
+            inputs_embeds_curr[:, :inputs_embeds.shape[1]] = inputs_embeds
+
+        if cfg > 0:
+            input_un_x = torch.tensor(un_x).unsqueeze(0).to(x.dtype).to(x.device)
+            input_un_x = torch.cat([input_un_x, x[:, input_ids.shape[1]:]], dim=1)
+            un_inpus_embeds = self.model.embed_tokens(input_un_x)
+
+            attention_mask_cond = torch.ones(
+                [1, inputs_embeds_curr.shape[1], inputs_embeds_curr.shape[1]]
+            )
+            attention_mask_cond = attention_mask_cond.to(torch.bool).to(inputs_embeds_curr.device)
+            attention_mask_uncond = torch.zeros(
+                [1, inputs_embeds_curr.shape[1], inputs_embeds_curr.shape[1]]
+            )
+            attention_mask_uncond[:, :un_inpus_embeds.shape[1], :un_inpus_embeds.shape[1]] = 1
+            attention_mask_uncond = attention_mask_uncond.to(torch.bool).to(inputs_embeds.device)
+            attention_mask = torch.cat([attention_mask_cond, attention_mask_uncond])
+            attention_mask = attention_mask.unsqueeze(1)
+
+            if inputs_embeds_curr.shape[1] != un_inpus_embeds.shape[1]:
+                un_inpus_embeds = torch.cat(
+                    [
+                        un_inpus_embeds,
+                        torch.zeros_like(
+                            inputs_embeds_curr[
+                                :,
+                                :inputs_embeds_curr.shape[1] - un_inpus_embeds.shape[1],
+                                :,
+                            ]
+                        ),
+                    ],
+                    dim=1,
+                )
+            input_inputs_embeds_curr = torch.cat([inputs_embeds_curr, un_inpus_embeds])
+
+            model_logits = self.forward_dream(
+                None,
+                attention_mask,
+                tok_idx,
+                inputs_embeds=input_inputs_embeds_curr,
+            ).logits
+            logits = model_logits[:1]
+            un_logits = model_logits[1:]
+            logits = un_logits + (cfg + 1) * (logits - un_logits)
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+        else:
+            logits = self.forward_dream(
+                None,
+                attention_mask,
+                tok_idx,
+                inputs_embeds=inputs_embeds_curr,
+            ).logits
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+        logits = generation_logits_hook_func(step, x, logits)
+
+        mask_logits = logits[mask_index]
+        if step == 0:
+            _input_index = torch.where(mask_index[0] == True)[0][0]
+
+        t = timesteps[step]
+        s = timesteps[step + 1]
+
+        if alg == 'origin':
+            p_transfer = 1 - s / t if step < steps - 1 else 1
+            x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
+            transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
+            _, x0[transfer_index_t_s] = sample_tokens(
+                mask_logits[transfer_index_t_s],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_position_penalty=max_position_penalty,
+            )
+            x[mask_index] = x0.clone()
+
+        else:
+            if alg == 'maskgit_plus':
+                confidence, x0 = sample_tokens(
+                    mask_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_position_penalty=max_position_penalty,
+                )
+            elif alg == 'topk_margin':
+                confidence, x0 = sample_tokens(
+                    mask_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    margin_confidence=True,
+                    max_position_penalty=max_position_penalty,
+                )
+            elif alg == 'entropy':
+                confidence, x0 = sample_tokens(
+                    mask_logits,
+                    temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    neg_entropy=True,
+                    max_position_penalty=max_position_penalty,
+                )
+            elif alg == "entropy-penalty":
+                confidence, x0 = sample_tokens(
+                    mask_logits,
+                    temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    neg_entropy=True,
+                    repeat_penalty=repeat_penalty if len(histories) != 0 else 1.0,
+                    past_x=histories[-1] if len(histories) != 0 else [],
+                    mask_id=mask_token_id,
+                    max_position_penalty=max_position_penalty,
+                )
+            else:
+                raise RuntimeError(f"Unknown alg: {alg}")
+
+            block_mask_1 = block_mask[mask_index[0]]
+            confidence = confidence + torch.where(block_mask_1, 0, -torch.inf).to(confidence.device)
+
+            num_mask_token = mask_index.sum()
+            num_mask_token = (x[:, block_mask] == mask_token_id).sum()
+            number_transfer_tokens = (
+                int(num_mask_token * (1 - s / t)) if step < steps - 1 else num_mask_token
+            )
+            number_transfer_tokens = max(number_transfer_tokens, 1)
+
+            if number_transfer_tokens > 0:
+                if alg_temp is None or alg_temp == 0:
+                    _, transfer_index = torch.topk(confidence, number_transfer_tokens)
+                else:
+                    confidence = confidence / alg_temp
+                    confidence = F.softmax(confidence, dim=-1)
+                    transfer_index = torch.multinomial(
+                        confidence,
+                        num_samples=number_transfer_tokens,
+                    )
+
+                x0_ = torch.zeros_like(x0, device=self.device, dtype=torch.long) + mask_token_id
+                x0_[transfer_index] = x0[transfer_index].clone()
+                x[mask_index] = x0_
+
+                _logit, _indic = torch.max(torch.softmax(logits.clone(), dim=-1), -1)
+                _logit = _logit[0][x[0] != 0]
+                _indic = _indic[0][x[0] != 0]
+                _temp_x = x[0][x[0] != 0]
+
+        x = generation_tokens_hook_func(step, x, logits)
+        return x, logits
+
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -470,6 +652,7 @@ class DreamGenerationMixin:
 
         task = None
         if "task" in kwargs: task = kwargs['task']
+        un_x = None
         if cfg > 0:
             import random
             empty_prompt = ""
@@ -495,126 +678,31 @@ class DreamGenerationMixin:
             for i in tqdm(range(steps)):
                 mask_index = (x == mask_token_id)
                 if mask_index.sum() == 0: break
-                inputs_embeds_curr = self.model.embed_tokens(x)
-
-                if inputs_embeds is not None:
-                    inputs_embeds_curr[:, :inputs_embeds.shape[1]] = inputs_embeds
-
-                if cfg > 0:
-                    input_un_x = torch.tensor(un_x).unsqueeze(0).to(x.dtype).to(x.device)
-                    input_un_x = torch.cat([input_un_x, x[:, input_ids.shape[1]:]], dim=1)
-                    un_inpus_embeds = self.model.embed_tokens(input_un_x)
-
-                    attention_mask_cond = torch.ones([1, inputs_embeds_curr.shape[1], inputs_embeds_curr.shape[1]])
-                    attention_mask_cond = attention_mask_cond.to(torch.bool).to(inputs_embeds_curr.device)
-                    attention_mask_uncond = torch.zeros([1, inputs_embeds_curr.shape[1], inputs_embeds_curr.shape[1]])
-                    attention_mask_uncond[:, :un_inpus_embeds.shape[1], :un_inpus_embeds.shape[1]] = 1
-                    attention_mask_uncond = attention_mask_uncond.to(torch.bool).to(inputs_embeds.device)
-                    attention_mask = torch.cat([attention_mask_cond, attention_mask_uncond])
-                    attention_mask = attention_mask.unsqueeze(1)
-
-                    if inputs_embeds_curr.shape[1] != un_inpus_embeds.shape[1]:
-                        un_inpus_embeds = torch.cat([un_inpus_embeds, 
-                            torch.zeros_like(inputs_embeds_curr[:, :inputs_embeds_curr.shape[1] - 
-                                                                un_inpus_embeds.shape[1], :])], dim=1)
-                    input_inputs_embeds_curr = torch.cat([inputs_embeds_curr, un_inpus_embeds])
-
-                    model_logits = self.forward_dream(None, attention_mask, tok_idx, 
-                                                      inputs_embeds=input_inputs_embeds_curr).logits 
-                    logits = model_logits[:1]; un_logits = model_logits[1:]
-                    logits = un_logits + (cfg + 1) * (logits - un_logits)
-                    logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
-
-                else:
-                    logits = self.forward_dream(None, attention_mask, tok_idx, 
-                                                inputs_embeds=inputs_embeds_curr).logits
-                    logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
-
-                logits = generation_logits_hook_func(i, x, logits)
-
-                mask_logits = logits[mask_index]
-                if i == 0:
-                    input_index = torch.where(mask_index[0]==True)[0][0]
-
-                t = timesteps[i]
-                s = timesteps[i + 1]
-
-                if alg == 'origin':
-                    p_transfer = 1 - s / t if i < steps - 1 else 1  
-                    x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
-                    transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
-                    _, x0[transfer_index_t_s] = sample_tokens(
-                        mask_logits[transfer_index_t_s],
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k,
-                        max_position_penalty=max_position_penalty,
-                    )
-                    x[mask_index] = x0.clone()
-
-                else:
-                    if alg == 'maskgit_plus':
-                        confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k, 
-                                                       max_position_penalty=max_position_penalty)
-                    elif alg == 'topk_margin':
-                        confidence, x0 = sample_tokens(
-                            mask_logits,
-                            temperature=temperature,
-                            top_p=top_p,
-                            top_k=top_k,
-                            margin_confidence=True,
-                            max_position_penalty=max_position_penalty,
-                        )
-                    elif alg == 'entropy':
-                        confidence, x0 = sample_tokens(
-                            mask_logits,
-                            temperature,
-                            top_p=top_p,
-                            top_k=top_k,
-                            neg_entropy=True,
-                            max_position_penalty=max_position_penalty,
-                        )
-                    elif alg == "entropy-penalty": 
-                        confidence, x0 = sample_tokens(
-                            mask_logits,
-                            temperature,
-                            top_p=top_p,
-                            top_k=top_k,
-                            neg_entropy=True,
-                            repeat_penalty=repeat_penalty if len(histories) != 0 else 1.0,
-                            past_x=histories[-1] if len(histories) != 0 else [],
-                            mask_id=mask_token_id,
-                            max_position_penalty=max_position_penalty,
-                        )
-                    else:
-                        raise RuntimeError(f"Unknown alg: {alg}")
-
-                    block_mask_1 = block_mask[mask_index[0]]
-                    confidence = confidence + torch.where(block_mask_1, 0, -torch.inf).to(confidence.device)
-
-                    num_mask_token = mask_index.sum()
-                    num_mask_token = (x[:, block_mask] == mask_token_id).sum()
-                    number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else num_mask_token
-                    number_transfer_tokens = max(number_transfer_tokens, 1)
-
-                    if number_transfer_tokens > 0:
-                        if alg_temp is None or alg_temp == 0:
-                            _, transfer_index = torch.topk(confidence, number_transfer_tokens)
-                        else:
-                            confidence = confidence / alg_temp
-                            confidence = F.softmax(confidence, dim=-1)
-                            transfer_index = torch.multinomial(confidence, num_samples=number_transfer_tokens)
-
-                        x0_ = torch.zeros_like(x0, device=self.device, dtype=torch.long) + mask_token_id
-                        x0_[transfer_index] = x0[transfer_index].clone()
-                        x[mask_index] = x0_
-
-                        logit,indic = torch.max(torch.softmax(logits.clone(),dim=-1),-1)
-                        logit = logit[0][x[0]!=0]
-                        indic = indic[0][x[0]!=0]
-                        temp_X = x[0][x[0]!=0]
-
-                x = generation_tokens_hook_func(i, x, logits)
+                x, logits = self._denoise_step(
+                    x=x,
+                    mask_index=mask_index,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    tok_idx=tok_idx,
+                    un_x=un_x,
+                    cfg=cfg,
+                    step=i,
+                    steps=steps,
+                    timesteps=timesteps,
+                    block_mask=block_mask,
+                    alg=alg,
+                    alg_temp=alg_temp,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_position_penalty=max_position_penalty,
+                    repeat_penalty=repeat_penalty,
+                    histories=histories,
+                    mask_token_id=mask_token_id,
+                    generation_tokens_hook_func=generation_tokens_hook_func,
+                    generation_logits_hook_func=generation_logits_hook_func,
+                )
 
                 if histories is not None:
                     histories.append(x.clone())
