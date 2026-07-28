@@ -114,6 +114,37 @@ class DreamModelOutput(ModelOutput):
     history: Optional[Tuple[torch.FloatTensor]] = None
 
 
+@dataclass(frozen=True)
+class DreamGenerationSchedule:
+    block_size: int
+    input_length: int
+    total_steps: int
+    eps: float
+    block_count: int
+
+    @classmethod
+    def from_state(
+        cls,
+        state: "DreamGenerationState",
+        *,
+        block_size: int,
+        input_length: int,
+        total_steps: int,
+        eps: float,
+    ) -> "DreamGenerationSchedule":
+        mask_count = int((state.x == state.mask_token_id).sum())
+        block_count = mask_count // block_size
+        if block_count * block_size < mask_count:
+            block_count += 1
+        return cls(
+            block_size=block_size,
+            input_length=input_length,
+            total_steps=total_steps,
+            eps=eps,
+            block_count=block_count,
+        )
+
+
 @dataclass
 class DreamGenerationState:
     x: torch.LongTensor
@@ -127,6 +158,7 @@ class DreamGenerationState:
     timesteps: Optional[torch.Tensor] = None
     block_mask: Optional[torch.Tensor] = None
     mask_index: Optional[torch.Tensor] = None
+    schedule_completed: bool = False
 
     def start_block(
         self,
@@ -137,20 +169,80 @@ class DreamGenerationState:
         block_mask: torch.Tensor,
     ) -> None:
         self.block_index = block_index
+        self.step = 0
         self.steps = steps
         self.timesteps = timesteps
         self.block_mask = block_mask
 
-    def start_step(self, step: int) -> torch.Tensor:
-        self.step = step
-        self.mask_index = self.x == self.mask_token_id
-        return self.mask_index
+    def start_schedule(self) -> None:
+        self.block_index = 0
+        self.step = 0
+        self.steps = 0
+        self.block_mask = None
+        self.mask_index = None
+        self.schedule_completed = False
+
+    def _start_scheduled_block(
+        self,
+        schedule: DreamGenerationSchedule,
+    ) -> None:
+        block_mask = torch.zeros(
+            [self.x.shape[-1]],
+            dtype=torch.bool,
+            device=self.x.device,
+        )
+        block_start = (
+            schedule.input_length
+            + self.block_index * schedule.block_size
+        )
+        block_end = block_start + schedule.block_size
+        block_mask[block_start:block_end] = True
+        generated_length = self.x.shape[-1] - schedule.input_length
+        steps = int(
+            block_mask.sum()
+            / generated_length
+            * schedule.total_steps
+        )
+        timesteps = torch.linspace(
+            1,
+            schedule.eps,
+            steps + 1,
+            device=self.x.device,
+        )
+        self.start_block(
+            block_index=self.block_index,
+            steps=steps,
+            timesteps=timesteps,
+            block_mask=block_mask,
+        )
+
+    def prepare_next_step(
+        self,
+        schedule: DreamGenerationSchedule,
+    ) -> bool:
+        while self.block_index < schedule.block_count:
+            if self.block_mask is None:
+                self._start_scheduled_block(schedule)
+
+            if self.step >= self.steps:
+                self.block_index += 1
+                self.block_mask = None
+                continue
+
+            self.mask_index = self.x == self.mask_token_id
+            if self.mask_index.sum() == 0:
+                self.schedule_completed = True
+                return False
+            return True
+        self.schedule_completed = True
+        return False
 
     def record_step(self, logits: torch.Tensor) -> None:
         if self.histories is not None:
             self.histories.append(self.x.clone())
             self.all_logits.append(torch.max(logits.clone(), -1)[-1])
         self.global_step += 1
+        self.step += 1
 
 
 @dataclass(frozen=True)
@@ -790,9 +882,15 @@ class DreamGenerationMixin:
 
         input_x = state.x.clone()
         total_steps = steps
-        block_num = (state.x == mask_token_id).sum() // block_size
-        if block_num * block_size < (state.x == mask_token_id).sum(): block_num += 1
         input_length = input_ids.shape[-1]
+        schedule = DreamGenerationSchedule.from_state(
+            state,
+            block_size=block_size,
+            input_length=input_length,
+            total_steps=total_steps,
+            eps=eps,
+        )
+        state.start_schedule()
 
         task = None
         if "task" in kwargs: task = kwargs['task']
@@ -832,24 +930,13 @@ class DreamGenerationMixin:
             generation_logits_hook_func=generation_logits_hook_func,
         )
 
-        for block_idx in range(block_num):
-            block_mask = torch.zeros([state.x.shape[-1]]).to(torch.bool).to(state.x.device)
-            block_mask[input_length + block_idx * block_size: input_length + (block_idx + 1) * block_size] = True
-            steps = int(block_mask.sum() / (state.x.shape[-1] - input_length) * total_steps)
-            timesteps = torch.linspace(1, eps, steps + 1, device=state.x.device)
-            state.start_block(
-                block_index=block_idx,
-                steps=steps,
-                timesteps=timesteps,
-                block_mask=block_mask,
-            )
-            for i in tqdm(range(steps)):
-                mask_index = state.start_step(i)
-                if mask_index.sum() == 0: break
+        with tqdm(total=total_steps) as progress:
+            while state.prepare_next_step(schedule):
                 logits = self._denoise_step(
                     state=state,
                     context=context,
                 )
                 state.record_step(logits)
+                progress.update()
 
         return self._finalize_generation_state(state)

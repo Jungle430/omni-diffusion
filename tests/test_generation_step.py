@@ -23,6 +23,7 @@ sys.modules[MODULE_SPEC.name] = GENERATION_UTILS
 MODULE_SPEC.loader.exec_module(GENERATION_UTILS)
 DreamGenerationMixin = GENERATION_UTILS.DreamGenerationMixin
 DreamGenerationContext = GENERATION_UTILS.DreamGenerationContext
+DreamGenerationSchedule = GENERATION_UTILS.DreamGenerationSchedule
 DreamGenerationState = GENERATION_UTILS.DreamGenerationState
 
 
@@ -79,6 +80,82 @@ def test_generation_state_initialization_and_finalization():
     assert histories is state.histories
 
 
+def test_generation_schedule_advances_across_blocks():
+    state = DreamGenerationState(
+        x=torch.tensor([[1, 9, 9, 9, 9, 9]]),
+        mask_token_id=9,
+        histories=None,
+        all_logits=[],
+    )
+    schedule = DreamGenerationSchedule.from_state(
+        state,
+        block_size=2,
+        input_length=1,
+        total_steps=5,
+        eps=0.001,
+    )
+    state.start_schedule()
+
+    visited_steps = []
+    while state.prepare_next_step(schedule):
+        visited_steps.append(
+            (state.block_index, state.step, state.steps)
+        )
+        state.record_step(torch.empty(0))
+
+    assert schedule.block_count == 3
+    assert visited_steps == [
+        (0, 0, 2),
+        (0, 1, 2),
+        (1, 0, 2),
+        (1, 1, 2),
+        (2, 0, 1),
+    ]
+    assert state.global_step == 5
+    assert state.schedule_completed
+
+
+def test_generation_schedule_stops_when_no_masks_remain():
+    state = DreamGenerationState(
+        x=torch.tensor([[1, 9]]),
+        mask_token_id=9,
+        histories=None,
+        all_logits=[],
+    )
+    schedule = DreamGenerationSchedule.from_state(
+        state,
+        block_size=1,
+        input_length=1,
+        total_steps=1,
+        eps=0.001,
+    )
+    state.start_schedule()
+    state.x[0, 1] = 3
+
+    assert not state.prepare_next_step(schedule)
+    assert state.global_step == 0
+    assert state.schedule_completed
+
+    empty_state = DreamGenerationState(
+        x=torch.tensor([[1]]),
+        mask_token_id=9,
+        histories=None,
+        all_logits=[],
+    )
+    empty_schedule = DreamGenerationSchedule.from_state(
+        empty_state,
+        block_size=1,
+        input_length=1,
+        total_steps=1,
+        eps=0.001,
+    )
+    empty_state.start_schedule()
+
+    assert empty_schedule.block_count == 0
+    assert not empty_state.prepare_next_step(empty_schedule)
+    assert empty_state.schedule_completed
+
+
 def test_forward_and_scheduler_split_model_compute_from_state_update():
     model = DummyDreamGenerationModel()
     token_ids = torch.tensor([[1, 9, 9]])
@@ -96,7 +173,7 @@ def test_forward_and_scheduler_split_model_compute_from_state_update():
         timesteps=torch.tensor([1.0, 0.5, 0.001]),
         block_mask=block_mask,
     )
-    assert torch.equal(state.start_step(0), mask_index)
+    state.mask_index = mask_index
     hook_calls = []
 
     def logits_hook(step, x, logits):
@@ -142,7 +219,7 @@ def test_forward_and_scheduler_split_model_compute_from_state_update():
 
     assert state.x.tolist() == [[1, 3, 9]]
     assert state.block_index == 0
-    assert state.step == 0
+    assert state.step == 1
     assert state.global_step == 1
     assert state.histories[0].tolist() == [[1, 3, 9]]
     assert len(state.all_logits) == 1
