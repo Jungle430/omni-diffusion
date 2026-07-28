@@ -114,6 +114,45 @@ class DreamModelOutput(ModelOutput):
     history: Optional[Tuple[torch.FloatTensor]] = None
 
 
+@dataclass
+class DreamGenerationState:
+    x: torch.LongTensor
+    mask_token_id: int
+    histories: Optional[list[torch.LongTensor]]
+    all_logits: list[torch.LongTensor]
+    block_index: int = 0
+    step: int = 0
+    global_step: int = 0
+    steps: int = 0
+    timesteps: Optional[torch.Tensor] = None
+    block_mask: Optional[torch.Tensor] = None
+    mask_index: Optional[torch.Tensor] = None
+
+    def start_block(
+        self,
+        *,
+        block_index: int,
+        steps: int,
+        timesteps: torch.Tensor,
+        block_mask: torch.Tensor,
+    ) -> None:
+        self.block_index = block_index
+        self.steps = steps
+        self.timesteps = timesteps
+        self.block_mask = block_mask
+
+    def start_step(self, step: int) -> torch.Tensor:
+        self.step = step
+        self.mask_index = self.x == self.mask_token_id
+        return self.mask_index
+
+    def record_step(self, logits: torch.Tensor) -> None:
+        if self.histories is not None:
+            self.histories.append(self.x.clone())
+            self.all_logits.append(torch.max(logits.clone(), -1)[-1])
+        self.global_step += 1
+
+
 class DreamGenerationConfig(GenerationConfig):
     def __init__(self, **kwargs):
         self.temperature: float = kwargs.pop("temperature", 0.0)
@@ -404,18 +443,13 @@ class DreamGenerationMixin:
     def _denoise_step(
         self,
         *,
-        x,
-        mask_index,
+        state: DreamGenerationState,
         input_ids,
         attention_mask,
         inputs_embeds,
         tok_idx,
         un_x,
         cfg,
-        step,
-        steps,
-        timesteps,
-        block_mask,
         alg,
         alg_temp,
         temperature,
@@ -423,11 +457,18 @@ class DreamGenerationMixin:
         top_k,
         max_position_penalty,
         repeat_penalty,
-        histories,
-        mask_token_id,
         generation_tokens_hook_func,
         generation_logits_hook_func,
     ):
+        x = state.x
+        mask_index = state.mask_index
+        step = state.step
+        steps = state.steps
+        timesteps = state.timesteps
+        block_mask = state.block_mask
+        histories = state.histories
+        mask_token_id = state.mask_token_id
+
         inputs_embeds_curr = self.model.embed_tokens(x)
 
         if inputs_embeds is not None:
@@ -580,8 +621,8 @@ class DreamGenerationMixin:
                 _indic = _indic[0][x[0] != 0]
                 _temp_x = x[0][x[0] != 0]
 
-        x = generation_tokens_hook_func(step, x, logits)
-        return x, logits
+        state.x = generation_tokens_hook_func(step, x, logits)
+        return logits
 
     def _sample(
         self,
@@ -636,18 +677,29 @@ class DreamGenerationMixin:
 
         timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
         x = generation_tokens_hook_func(None, x, None)
+        state = DreamGenerationState(
+            x=x,
+            mask_token_id=mask_token_id,
+            histories=histories,
+            all_logits=all_logit,
+            steps=steps,
+            timesteps=timesteps,
+        )
 
         if step_ratio is not None:
             steps = int(max_new_tokens * step_ratio)
 
         if add_boa_token:
-            bos_index = int((x.shape[1] - (x == mask_token_id).sum()) + (x == mask_token_id).sum() * 0.2)
-            x[:, bos_index] = 151684 # <|begin_of_audio|>
+            bos_index = int(
+                (state.x.shape[1] - (state.x == mask_token_id).sum())
+                + (state.x == mask_token_id).sum() * 0.2
+            )
+            state.x[:, bos_index] = 151684 # <|begin_of_audio|>
 
-        input_x = x.clone()
+        input_x = state.x.clone()
         total_steps = steps
-        block_num = (x == mask_token_id).sum() // block_size
-        if block_num * block_size < (x == mask_token_id).sum(): block_num += 1
+        block_num = (state.x == mask_token_id).sum() // block_size
+        if block_num * block_size < (state.x == mask_token_id).sum(): block_num += 1
         input_length = input_ids.shape[-1]
 
         task = None
@@ -671,26 +723,27 @@ class DreamGenerationMixin:
                 un_x = un_x + un_x_text + kwargs['tokenizer'].encode("<|im_end|>\n<|im_start|>assistant\n")
 
         for block_idx in range(block_num):
-            block_mask = torch.zeros([x.shape[-1]]).to(torch.bool).to(x.device)
+            block_mask = torch.zeros([state.x.shape[-1]]).to(torch.bool).to(state.x.device)
             block_mask[input_length + block_idx * block_size: input_length + (block_idx + 1) * block_size] = True
-            steps = int(block_mask.sum() / (x.shape[-1] - input_length) * total_steps)
-            timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+            steps = int(block_mask.sum() / (state.x.shape[-1] - input_length) * total_steps)
+            timesteps = torch.linspace(1, eps, steps + 1, device=state.x.device)
+            state.start_block(
+                block_index=block_idx,
+                steps=steps,
+                timesteps=timesteps,
+                block_mask=block_mask,
+            )
             for i in tqdm(range(steps)):
-                mask_index = (x == mask_token_id)
+                mask_index = state.start_step(i)
                 if mask_index.sum() == 0: break
-                x, logits = self._denoise_step(
-                    x=x,
-                    mask_index=mask_index,
+                logits = self._denoise_step(
+                    state=state,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     inputs_embeds=inputs_embeds,
                     tok_idx=tok_idx,
                     un_x=un_x,
                     cfg=cfg,
-                    step=i,
-                    steps=steps,
-                    timesteps=timesteps,
-                    block_mask=block_mask,
                     alg=alg,
                     alg_temp=alg_temp,
                     temperature=temperature,
@@ -698,14 +751,9 @@ class DreamGenerationMixin:
                     top_k=top_k,
                     max_position_penalty=max_position_penalty,
                     repeat_penalty=repeat_penalty,
-                    histories=histories,
-                    mask_token_id=mask_token_id,
                     generation_tokens_hook_func=generation_tokens_hook_func,
                     generation_logits_hook_func=generation_logits_hook_func,
                 )
+                state.record_step(logits)
 
-                if histories is not None:
-                    histories.append(x.clone())
-                    all_logit.append(torch.max(logits.clone(),-1)[-1])
-
-        return (x, histories)
+        return (state.x, state.histories)

@@ -22,6 +22,7 @@ GENERATION_UTILS = importlib.util.module_from_spec(MODULE_SPEC)
 sys.modules[MODULE_SPEC.name] = GENERATION_UTILS
 MODULE_SPEC.loader.exec_module(GENERATION_UTILS)
 DreamGenerationMixin = GENERATION_UTILS.DreamGenerationMixin
+DreamGenerationState = GENERATION_UTILS.DreamGenerationState
 
 
 class DummyDreamGenerationModel(DreamGenerationMixin):
@@ -48,6 +49,19 @@ def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
     token_ids = torch.tensor([[1, 9, 9]])
     mask_index = token_ids == 9
     block_mask = torch.tensor([False, True, True])
+    state = DreamGenerationState(
+        x=token_ids,
+        mask_token_id=9,
+        histories=[],
+        all_logits=[],
+    )
+    state.start_block(
+        block_index=0,
+        steps=2,
+        timesteps=torch.tensor([1.0, 0.5, 0.001]),
+        block_mask=block_mask,
+    )
+    assert torch.equal(state.start_step(0), mask_index)
     hook_calls = []
 
     def logits_hook(step, x, logits):
@@ -56,21 +70,16 @@ def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
 
     def tokens_hook(step, x, logits):
         hook_calls.append(("tokens", step, x.clone()))
-        return x
+        return x.clone()
 
-    updated_ids, logits = model._denoise_step(
-        x=token_ids,
-        mask_index=mask_index,
+    logits = model._denoise_step(
+        state=state,
         input_ids=torch.tensor([[1]]),
         attention_mask=None,
         inputs_embeds=None,
         tok_idx=None,
         un_x=None,
         cfg=0,
-        step=0,
-        steps=2,
-        timesteps=torch.tensor([1.0, 0.5, 0.001]),
-        block_mask=block_mask,
         alg="entropy-penalty",
         alg_temp=0,
         temperature=0,
@@ -78,14 +87,18 @@ def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
         top_k=None,
         max_position_penalty=1,
         repeat_penalty=1,
-        histories=[],
-        mask_token_id=9,
         generation_tokens_hook_func=tokens_hook,
         generation_logits_hook_func=logits_hook,
     )
+    state.record_step(logits)
 
-    assert updated_ids.tolist() == [[1, 3, 9]]
+    assert state.x.tolist() == [[1, 3, 9]]
     assert logits.shape == (1, 3, 10)
+    assert state.block_index == 0
+    assert state.step == 0
+    assert state.global_step == 1
+    assert state.histories[0].tolist() == [[1, 3, 9]]
+    assert len(state.all_logits) == 1
     assert [call[:2] for call in hook_calls] == [
         ("logits", 0),
         ("tokens", 0),
