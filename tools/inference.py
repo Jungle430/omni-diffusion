@@ -803,6 +803,42 @@ def save_output(output_path, prefix, output, images, speech):
         print("\n\n".join(output), file=fout)
 
 
+def run_task(
+    task,
+    s2s_inference,
+    max_tokens,
+    steps,
+    alg,
+    repeat_penalty,
+):
+    if task == "t2i":
+        output, images = t2i_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        return output, images, None
+    if task == "vqa":
+        output = vqa_task(s2s_inference, max_tokens, steps, alg, repeat_penalty)
+        return output, None, None
+    if task == "asr":
+        output = asr_task(s2s_inference, max_tokens, steps, alg, repeat_penalty)
+        return output, None, None
+    if task == "tts":
+        output, speech = tts_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        return output, None, speech
+    if task == "s2i":
+        output, images = s2i_task(
+            s2s_inference, max_tokens, steps, alg, repeat_penalty
+        )
+        return output, images, None
+
+    output, speech = svqa_task(
+        s2s_inference, max_tokens, steps, alg, repeat_penalty
+    )
+    return output, None, speech
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="",
@@ -828,6 +864,18 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--alg", type=str, default=None)
     parser.add_argument("--repeat_penalty", type=float, default=None)
+    parser.add_argument(
+        "--warmup_runs",
+        type=int,
+        default=0,
+        help="Run this many unprofiled requests after model loading.",
+    )
+    parser.add_argument(
+        "--measurement_runs",
+        type=int,
+        default=1,
+        help="Run this many measured requests in the same model process.",
+    )
     diagnostics_group = parser.add_mutually_exclusive_group()
     diagnostics_group.add_argument(
         "--profile_json",
@@ -849,6 +897,10 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    if args.warmup_runs < 0:
+        parser.error("--warmup_runs must be non-negative.")
+    if args.measurement_runs <= 0:
+        parser.error("--measurement_runs must be positive.")
 
     device_map = "cuda:0"
     audio_tokenizer_rank = 0
@@ -862,21 +914,13 @@ if __name__ == "__main__":
 
     os.makedirs(output_path, exist_ok=True)
 
-    diagnostics = None
-    if args.profile_json or args.trace_jsonl:
-        diagnostics = GenerationDiagnostics(
-            profile_path=args.profile_json,
-            trace_path=args.trace_jsonl,
-            trace_topk=args.trace_topk,
-        )
-
     s2s_inference = S2SInference(
         model_name_or_path,
         audio_tokenizer_path,
         audio_tokenizer_type,
         image_tokenizer_path,
         flow_path=flow_path,
-        diagnostics=diagnostics,
+        diagnostics=None,
     )
 
     task_defaults = {
@@ -897,32 +941,59 @@ if __name__ == "__main__":
         else repeat_penalty
     )
 
-    if args.task == "t2i":
-        output, images = t2i_task(
+    for run_index in range(args.warmup_runs):
+        print(
+            f"Warmup run {run_index + 1}/{args.warmup_runs}",
+            flush=True,
+        )
+        set_seed()
+        run_task(
+            args.task,
+            s2s_inference,
+            max_tokens,
+            steps,
+            alg,
+            repeat_penalty,
+        )
+    if args.warmup_runs and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    diagnostics = None
+    if args.profile_json or args.trace_jsonl:
+        diagnostics = GenerationDiagnostics(
+            profile_path=args.profile_json,
+            trace_path=args.trace_jsonl,
+            trace_topk=args.trace_topk,
+        )
+        diagnostics.install(s2s_inference.model)
+        s2s_inference.diagnostics = diagnostics
+
+    all_output = []
+    all_images = []
+    all_speech = []
+    for run_index in range(args.measurement_runs):
+        print(
+            f"Measurement run {run_index + 1}/{args.measurement_runs}",
+            flush=True,
+        )
+        set_seed()
+        output, images, speech = run_task(
+            args.task,
             s2s_inference, max_tokens, steps, alg, repeat_penalty
         )
-        save_output(output_path, args.task, output, images, None)
-    elif args.task == "vqa":
-        output = vqa_task(s2s_inference, max_tokens, steps, alg, repeat_penalty)
-        save_output(output_path, args.task, output, None, None)
-    elif args.task == "asr":
-        output = asr_task(s2s_inference, max_tokens, steps, alg, repeat_penalty)
-        save_output(output_path, args.task, output, None, None)
-    elif args.task == "tts":
-        output, speech = tts_task(
-            s2s_inference, max_tokens, steps, alg, repeat_penalty
-        )
-        save_output(output_path, args.task, output, None, speech)
-    elif args.task == "s2i":
-        output, images = s2i_task(
-            s2s_inference, max_tokens, steps, alg, repeat_penalty
-        )
-        save_output(output_path, args.task, output, images, None)
-    else:
-        output, speech = svqa_task(
-            s2s_inference, max_tokens, steps, alg, repeat_penalty
-        )
-        save_output(output_path, args.task, output, None, speech)
+        all_output.extend(output)
+        if images is not None:
+            all_images.extend(images)
+        if speech is not None:
+            all_speech.extend(speech)
+
+    save_output(
+        output_path,
+        args.task,
+        all_output,
+        all_images or None,
+        all_speech or None,
+    )
 
     if diagnostics is not None:
         diagnostics.close(
@@ -933,6 +1004,8 @@ if __name__ == "__main__":
                 "steps": steps,
                 "alg": alg,
                 "repeat_penalty": repeat_penalty,
+                "warmup_runs": args.warmup_runs,
+                "measurement_runs": args.measurement_runs,
                 "torch": torch.__version__,
                 "torch_cuda": torch.version.cuda,
             }
