@@ -79,7 +79,7 @@ def test_generation_state_initialization_and_finalization():
     assert histories is state.histories
 
 
-def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
+def test_forward_and_scheduler_split_model_compute_from_state_update():
     model = DummyDreamGenerationModel()
     token_ids = torch.tensor([[1, 9, 9]])
     mask_index = token_ids == 9
@@ -124,14 +124,23 @@ def test_denoise_step_updates_selected_mask_and_preserves_hook_order():
         generation_tokens_hook_func=tokens_hook,
         generation_logits_hook_func=logits_hook,
     )
-    logits = model._denoise_step(
+    logits = model._forward_denoise_step(
         state=state,
         context=context,
+    )
+
+    assert state.x.tolist() == [[1, 9, 9]]
+    assert logits.shape == (1, 3, 10)
+    assert [call[:2] for call in hook_calls] == [("logits", 0)]
+
+    model._step_scheduler(
+        state=state,
+        context=context,
+        logits=logits,
     )
     state.record_step(logits)
 
     assert state.x.tolist() == [[1, 3, 9]]
-    assert logits.shape == (1, 3, 10)
     assert state.block_index == 0
     assert state.step == 0
     assert state.global_step == 1

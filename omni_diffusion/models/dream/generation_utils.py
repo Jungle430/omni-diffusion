@@ -510,34 +510,20 @@ class DreamGenerationMixin:
     ) -> tuple[torch.LongTensor, Optional[list[torch.LongTensor]]]:
         return state.x, state.histories
 
-    def _denoise_step(
+    def _forward_denoise_step(
         self,
         *,
         state: DreamGenerationState,
         context: DreamGenerationContext,
     ) -> torch.Tensor:
         x = state.x
-        mask_index = state.mask_index
         step = state.step
-        steps = state.steps
-        timesteps = state.timesteps
-        block_mask = state.block_mask
-        histories = state.histories
-        mask_token_id = state.mask_token_id
         input_ids = context.input_ids
         attention_mask = context.attention_mask
         inputs_embeds = context.inputs_embeds
         tok_idx = context.tok_idx
         un_x = context.un_x
         cfg = context.cfg
-        alg = context.alg
-        alg_temp = context.alg_temp
-        temperature = context.temperature
-        top_p = context.top_p
-        top_k = context.top_k
-        max_position_penalty = context.max_position_penalty
-        repeat_penalty = context.repeat_penalty
-        generation_tokens_hook_func = context.generation_tokens_hook_func
         generation_logits_hook_func = context.generation_logits_hook_func
 
         inputs_embeds_curr = self.model.embed_tokens(x)
@@ -599,6 +585,31 @@ class DreamGenerationMixin:
             logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
         logits = generation_logits_hook_func(step, x, logits)
+        return logits
+
+    def _step_scheduler(
+        self,
+        *,
+        state: DreamGenerationState,
+        context: DreamGenerationContext,
+        logits: torch.Tensor,
+    ) -> None:
+        x = state.x
+        mask_index = state.mask_index
+        step = state.step
+        steps = state.steps
+        timesteps = state.timesteps
+        block_mask = state.block_mask
+        histories = state.histories
+        mask_token_id = state.mask_token_id
+        alg = context.alg
+        alg_temp = context.alg_temp
+        temperature = context.temperature
+        top_p = context.top_p
+        top_k = context.top_k
+        max_position_penalty = context.max_position_penalty
+        repeat_penalty = context.repeat_penalty
+        generation_tokens_hook_func = context.generation_tokens_hook_func
 
         mask_logits = logits[mask_index]
         if step == 0:
@@ -693,6 +704,22 @@ class DreamGenerationMixin:
                 _temp_x = x[0][x[0] != 0]
 
         state.x = generation_tokens_hook_func(step, x, logits)
+
+    def _denoise_step(
+        self,
+        *,
+        state: DreamGenerationState,
+        context: DreamGenerationContext,
+    ) -> torch.Tensor:
+        logits = self._forward_denoise_step(
+            state=state,
+            context=context,
+        )
+        self._step_scheduler(
+            state=state,
+            context=context,
+            logits=logits,
+        )
         return logits
 
     def _sample(
